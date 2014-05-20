@@ -1050,7 +1050,6 @@ ngx_http_lua_socket_ssl_handshake_ended(ngx_http_request_t *r,
         X509_free(cert);
     }
     
-    c->log->action = "SSL connection transaction";
     lua_pushinteger(L, 1);
     return 1;
 }
