@@ -1058,6 +1058,20 @@ ngx_http_lua_run_thread(lua_State *L, ngx_http_request_t *r,
             dd("cur co status: %d", ctx->cur_co_ctx->co_status);
 
             orig_coctx = ctx->cur_co_ctx;
+
+            dd("%p: saved co top: %d, nrets: %d, true top: %d",
+               orig_coctx->co,
+               (int) orig_coctx->co_top, (int) nrets,
+               (int) lua_gettop(orig_coctx->co));
+#if DDEBUG
+            if (lua_gettop(orig_coctx->co) > 0) {
+                dd("top elem: %s", luaL_typename(orig_coctx->co, -1));
+            }
+#endif
+
+            ngx_http_lua_assert(orig_coctx->co_top + nrets
+                                == lua_gettop(orig_coctx->co));
+
             rv = lua_resume(orig_coctx->co, nrets);
 
 #if (NGX_PCRE)
@@ -1083,6 +1097,13 @@ ngx_http_lua_run_thread(lua_State *L, ngx_http_request_t *r,
                 ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
                                "lua thread yielded");
 
+#ifdef ngx_http_lua_assert
+                dd("%p: saving curr top after yield: %d (co-op: %d)",
+                   orig_coctx->co,
+                   (int) lua_gettop(orig_coctx->co), (int) ctx->co_op);
+                orig_coctx->co_top = lua_gettop(orig_coctx->co);
+#endif
+
                 if (r->uri_changed) {
                     return ngx_http_lua_handle_rewrite_jump(L, r, ctx);
                 }
@@ -1103,7 +1124,10 @@ ngx_http_lua_run_thread(lua_State *L, ngx_http_request_t *r,
                 case NGX_HTTP_LUA_USER_CORO_NOP:
                     dd("hit! it is the API yield");
 
-                    lua_settop(ctx->cur_co_ctx->co, 0);
+#ifdef ngx_http_lua_assert
+                    ngx_http_lua_assert(lua_gettop(ctx->cur_co_ctx->co) == 0);
+#endif
+
                     ctx->cur_co_ctx = NULL;
 
                     return NGX_AGAIN;
@@ -1116,6 +1140,10 @@ ngx_http_lua_run_thread(lua_State *L, ngx_http_request_t *r,
                     ctx->co_op = NGX_HTTP_LUA_USER_CORO_NOP;
                     nrets = lua_gettop(ctx->cur_co_ctx->co) - 1;
                     dd("nrets = %d", nrets);
+#ifdef ngx_http_lua_assert
+                    /* ignore the return value (the thread) already pushed */
+                    orig_coctx->co_top--;
+#endif
 
                     break;
 
@@ -1133,7 +1161,11 @@ ngx_http_lua_run_thread(lua_State *L, ngx_http_request_t *r,
 
                     nrets = lua_gettop(old_co);
                     if (nrets) {
+                        dd("moving %d return values to parent", nrets);
                         lua_xmove(old_co, ctx->cur_co_ctx->co, nrets);
+#ifdef ngx_http_lua_assert
+                        ctx->cur_co_ctx->parent_co_ctx->co_top -= nrets;
+#endif
                     }
 
                     break;
@@ -1149,7 +1181,13 @@ ngx_http_lua_run_thread(lua_State *L, ngx_http_request_t *r,
                     if (ngx_http_lua_is_thread(ctx)) {
                         ngx_http_lua_probe_thread_yield(r, ctx->cur_co_ctx->co);
 
+                        /* discard any return values from user
+                         * coroutine.yield()'s arguments */
                         lua_settop(ctx->cur_co_ctx->co, 0);
+
+#ifdef ngx_http_lua_assert
+                        ctx->cur_co_ctx->co_top = 0;
+#endif
 
                         ngx_http_lua_probe_info("set co running");
                         ctx->cur_co_ctx->co_status = NGX_HTTP_LUA_CO_RUNNING;
@@ -1181,10 +1219,14 @@ ngx_http_lua_run_thread(lua_State *L, ngx_http_request_t *r,
                     lua_pushboolean(next_co, 1);
 
                     if (nrets) {
+                        dd("moving %d return values to next co", nrets);
                         lua_xmove(ctx->cur_co_ctx->co, next_co, nrets);
+#ifdef ngx_http_lua_assert
+                        ctx->cur_co_ctx->co_top -= nrets;
+#endif
                     }
 
-                    nrets++;
+                    nrets++;  /* add the true boolean value */
 
                     ctx->cur_co_ctx = next_coctx;
 
@@ -1196,10 +1238,7 @@ ngx_http_lua_run_thread(lua_State *L, ngx_http_request_t *r,
 
             case 0:
 
-                if (ctx->cur_co_ctx->cleanup) {
-                    ctx->cur_co_ctx->cleanup(ctx->cur_co_ctx);
-                    ctx->cur_co_ctx->cleanup = NULL;
-                }
+                ngx_http_lua_cleanup_pending_operation(ctx->cur_co_ctx);
 
                 ngx_http_lua_probe_coroutine_done(r, ctx->cur_co_ctx->co, 1);
 
@@ -1358,12 +1397,7 @@ user_co_done:
                 msg = "unknown reason";
             }
 
-#if 1
-            if (ctx->cur_co_ctx->cleanup) {
-                ctx->cur_co_ctx->cleanup(ctx->cur_co_ctx);
-                ctx->cur_co_ctx->cleanup = NULL;
-            }
-#endif
+            ngx_http_lua_cleanup_pending_operation(ctx->cur_co_ctx);
 
             ngx_http_lua_probe_coroutine_done(r, ctx->cur_co_ctx->co, 0);
 
@@ -2144,10 +2178,7 @@ ngx_http_lua_handle_exec(lua_State *L, ngx_http_request_t *r,
                    "lua thread initiated internal redirect to %V",
                    &ctx->exec_uri);
 
-    if (ctx->cur_co_ctx->cleanup) {
-        ctx->cur_co_ctx->cleanup(ctx->cur_co_ctx);
-        ctx->cur_co_ctx->cleanup = NULL;
-    }
+    ngx_http_lua_cleanup_pending_operation(ctx->cur_co_ctx);
 
     ngx_http_lua_probe_coroutine_done(r, ctx->cur_co_ctx->co, 1);
 
@@ -2254,10 +2285,7 @@ ngx_http_lua_handle_exit(lua_State *L, ngx_http_request_t *r,
     }
 #endif
 
-    if (ctx->cur_co_ctx->cleanup) {
-        ctx->cur_co_ctx->cleanup(ctx->cur_co_ctx);
-        ctx->cur_co_ctx->cleanup = NULL;
-    }
+    ngx_http_lua_cleanup_pending_operation(ctx->cur_co_ctx);
 
     ngx_http_lua_probe_coroutine_done(r, ctx->cur_co_ctx->co, 1);
 
@@ -2597,10 +2625,7 @@ ngx_http_lua_handle_rewrite_jump(lua_State *L, ngx_http_request_t *r,
                    "lua thread aborting request with URI rewrite jump: "
                    "\"%V?%V\"", &r->uri, &r->args);
 
-    if (ctx->cur_co_ctx->cleanup) {
-        ctx->cur_co_ctx->cleanup(ctx->cur_co_ctx);
-        ctx->cur_co_ctx->cleanup = NULL;
-    }
+    ngx_http_lua_cleanup_pending_operation(ctx->cur_co_ctx);
 
     ngx_http_lua_probe_coroutine_done(r, ctx->cur_co_ctx->co, 1);
 
@@ -3156,19 +3181,13 @@ ngx_http_lua_finalize_coroutines(ngx_http_request_t *r, ngx_http_lua_ctx_t *ctx)
             }
 
             coctx = &cc[i];
-            if (coctx->cleanup) {
-                coctx->cleanup(coctx);
-                coctx->cleanup = NULL;
-                coctx->co_status = NGX_HTTP_LUA_CO_DEAD;
-                /* TODO we could also free the user thread here */
-            }
+            ngx_http_lua_cleanup_pending_operation(coctx);
+            coctx->co_status = NGX_HTTP_LUA_CO_DEAD;
+            /* TODO we could also free the user thread here */
         }
     }
 
-    coctx = &ctx->entry_co_ctx;
-    if (coctx->cleanup) {
-        coctx->cleanup(coctx);
-    }
+    ngx_http_lua_cleanup_pending_operation(&ctx->entry_co_ctx);
 }
 
 
@@ -3474,6 +3493,13 @@ ngx_http_lua_test_expect(ngx_http_request_t *r)
 void
 ngx_http_lua_finalize_request(ngx_http_request_t *r, ngx_int_t rc)
 {
+    ngx_http_lua_ctx_t              *ctx;
+
+    ctx = ngx_http_get_module_ctx(r, ngx_http_lua_module);
+    if (ctx && ctx->cur_co_ctx) {
+        ngx_http_lua_cleanup_pending_operation(ctx->cur_co_ctx);
+    }
+
     if (r->connection->fd != -1) {
         ngx_http_finalize_request(r, rc);
         return;

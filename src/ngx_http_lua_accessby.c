@@ -221,7 +221,7 @@ ngx_http_lua_access_handler_file(ngx_http_request_t *r)
     }
 
     /*  make sure we have a valid code chunk */
-    assert(lua_isfunction(L, -1));
+    ngx_http_lua_assert(lua_isfunction(L, -1));
 
     return ngx_http_lua_access_by_chunk(L, r);
 }
@@ -276,6 +276,9 @@ ngx_http_lua_access_by_chunk(lua_State *L, ngx_http_request_t *r)
     ctx->cur_co_ctx = &ctx->entry_co_ctx;
     ctx->cur_co_ctx->co = co;
     ctx->cur_co_ctx->co_ref = co_ref;
+#ifdef ngx_http_lua_assert
+    ctx->cur_co_ctx->co_top = 1;
+#endif
 
     /*  }}} */
 
